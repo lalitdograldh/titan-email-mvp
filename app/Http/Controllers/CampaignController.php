@@ -21,6 +21,7 @@ class CampaignController extends Controller
 {
     private static $graphClient = null;
 
+    // 1) Build Graph client using client credentials
     private static function getGraphClient()
     {
         if (self::$graphClient) {
@@ -36,7 +37,10 @@ class CampaignController extends Controller
         }
 
         $tokenRequestContext = new ClientCredentialContext($tenantId, $clientId, $clientSecret);
-        self::$graphClient = new GraphServiceClient($tokenRequestContext, ['https://graph.microsoft.com/.default']);
+        self::$graphClient = new GraphServiceClient(
+            $tokenRequestContext,
+            ['https://graph.microsoft.com/.default']
+        );
 
         return self::$graphClient;
     }
@@ -61,12 +65,13 @@ class CampaignController extends Controller
     public function store(Request $request)
     {
         $request->validate([
-            'name'       => 'required|string|max:255',
-            'subject'    => 'required|string|max:255',
-            'body_html'  => 'required',
+            'name'      => 'required|string|max:255',
+            'subject'   => 'required|string|max:255',
+            'body_html' => 'required',
         ]);
 
-        $previewLead = Lead::first();        
+        // Use first lead only for preview token replacement
+        $previewLead = Lead::first();
 
         if ($previewLead) {
             $replacements = [
@@ -93,7 +98,7 @@ class CampaignController extends Controller
             ['status' => 'draft']
         ));
 
-        // ✅ FIXED: Get Outlook account and assign to all email logs
+        // Get Outlook account (from DB)
         $outlookAccount = OutlookAccount::where('is_active', true)
             ->orderBy('daily_sent')
             ->first();
@@ -102,15 +107,16 @@ class CampaignController extends Controller
             return back()->with('error', 'No active Outlook accounts available.');
         }
 
+        // Create logs for all leads
         $leads = Lead::all();
 
         foreach ($leads as $lead) {
             EmailLog::create([
-                'campaign_id' => $campaign->id,
-                'lead_id'     => $lead->id,
-                'outlook_account_id' => $outlookAccount->id, // ✅ NOW SETS outlook_account_id
-                'to_email'    => $lead->email,
-                'status'      => 'queued',
+                'campaign_id'        => $campaign->id,
+                'lead_id'            => $lead->id,
+                'outlook_account_id' => $outlookAccount->id,
+                'to_email'           => $lead->email,
+                'status'             => 'queued',
             ]);
         }
 
@@ -154,6 +160,7 @@ class CampaignController extends Controller
             return back()->with('warning', 'No queued emails.');
         }
 
+        // IMPORTANT: this email must be an existing mailbox in your tenant
         $outlookAccount = OutlookAccount::first();
         if (!$outlookAccount) {
             return back()->with('error', 'No Outlook account configured.');
@@ -166,22 +173,24 @@ class CampaignController extends Controller
             return back()->with('error', 'Failed to initialize Microsoft Graph client: ' . $e->getMessage());
         }
 
-        $sent = 0;
+        $sent   = 0;
         $failed = 0;
 
         foreach ($logs as $log) {
             try {
                 $this->sendEmailWithGraph($log, $campaign, $outlookAccount->email, $graphClient);
                 $sent++;
+                // optional: small delay to avoid throttling
+                // sleep(1);
             } catch (\Exception $e) {
                 $log->update([
-                    'status' => 'failed',
+                    'status'        => 'failed',
                     'error_message' => $e->getMessage(),
                 ]);
                 $failed++;
                 Log::error('Email Send Failed', [
                     'log_id' => $log->id,
-                    'error' => $e->getMessage()
+                    'error'  => $e->getMessage()
                 ]);
             }
         }
@@ -195,20 +204,26 @@ class CampaignController extends Controller
             ->with('success', "Emails sent: {$sent}, Failed: {$failed}");
     }
 
-    private function sendEmailWithGraph(EmailLog $log, Campaign $campaign, string $userEmail, GraphServiceClient $graphClient)
-    {
+    // 2) Build and send the email using Graph
+    private function sendEmailWithGraph(
+        EmailLog $log,
+        Campaign $campaign,
+        string $userEmail,
+        GraphServiceClient $graphClient
+    ) {
+        // Replace tokens per-lead
         $replacements = [
-            '{name}' => $log->lead?->name ?? 'Customer',
+            '{name}'    => $log->lead?->name ?? 'Customer',
             '{company}' => $log->lead?->company ?? '',
         ];
 
         $subject = str_replace(array_keys($replacements), array_values($replacements), $campaign->subject);
-        $body = str_replace(array_keys($replacements), array_values($replacements), $campaign->body_html);
+        $body    = str_replace(array_keys($replacements), array_values($replacements), $campaign->body_html);
 
         $log->update([
-            'subject' => $subject,
+            'subject'   => $subject,
             'body_html' => $body,
-            'status' => 'sending',
+            'status'    => 'sending',
         ]);
 
         $message = new Message();
@@ -219,21 +234,25 @@ class CampaignController extends Controller
         $bodyContent->setContent($body);
         $message->setBody($bodyContent);
 
-        $toRecipient = new Recipient();
+        $toRecipient  = new Recipient();
         $emailAddress = new EmailAddress();
         $emailAddress->setAddress($log->to_email);
         $toRecipient->setEmailAddress($emailAddress);
-        $recipients = [$toRecipient];
-        $message->setToRecipients($recipients);
+        $message->setToRecipients([$toRecipient]);
 
         $sendMailRequestBody = new SendMailPostRequestBody();
         $sendMailRequestBody->setMessage($message);
         $sendMailRequestBody->setSaveToSentItems(true);
 
-        $graphClient->users()->byUserId($userEmail)->sendMail()->post($sendMailRequestBody);
+        // CRITICAL: userEmail must be a valid user id or UPN that can send mail
+        $graphClient
+            ->users()
+            ->byUserId($userEmail)
+            ->sendMail()
+            ->post($sendMailRequestBody);
 
         $log->update([
-            'status' => 'sent',
+            'status'        => 'sent',
             'error_message' => null,
         ]);
     }
@@ -242,6 +261,7 @@ class CampaignController extends Controller
     {
         EmailLog::where('campaign_id', $campaign->id)->delete();
         $campaign->delete();
+
         return redirect()
             ->route('campaigns.index')
             ->with('success', 'Campaign deleted successfully!');
